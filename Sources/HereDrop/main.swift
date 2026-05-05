@@ -55,7 +55,7 @@ private struct LocalUploadFile: Sendable {
     let hash: String
 }
 
-private struct FileDescriptor: Encodable {
+private struct FileDescriptor: Codable, Sendable {
     let path: String
     let size: Int64
     let contentType: String
@@ -108,6 +108,12 @@ private struct FinalizeResponse: Decodable {
     let siteUrl: String?
 }
 
+private struct SiteDetailsResponse: Decodable {
+    let slug: String
+    let siteUrl: String
+    let manifest: [FileDescriptor]
+}
+
 private struct PublishResult: Sendable {
     let siteURL: String
     let clipboardURL: String
@@ -154,12 +160,12 @@ private final class ProjectStore {
         projects = decoded.projects.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
-    func createProject(name: String, pathPrefix: String) throws -> ShareProject {
+    func createProject(name: String, pathPrefix: String, slug: String?) throws -> ShareProject {
         let now = Date()
         let project = ShareProject(
             id: UUID().uuidString,
             name: name.trimmingCharacters(in: .whitespacesAndNewlines),
-            slug: nil,
+            slug: Self.normalizedSlug(slug),
             pathPrefix: Self.normalizedPathPrefix(pathPrefix),
             createdAt: now,
             updatedAt: now
@@ -230,6 +236,22 @@ private final class ProjectStore {
     private func sortProjects() {
         projects.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
+
+    static func normalizedSlug(_ value: String?) -> String? {
+        guard let value else {
+            return nil
+        }
+        let slug = value
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard !slug.isEmpty else {
+            return nil
+        }
+        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyz0123456789-")
+        let cleaned = String(slug.unicodeScalars.map { allowed.contains($0) ? Character($0) : "-" })
+            .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        return cleaned.isEmpty ? nil : cleaned
+    }
 }
 
 private final class HereNowUploader {
@@ -249,18 +271,31 @@ private final class HereNowUploader {
         let apiKey = loadAPIKey()
         var project = project
         let localFiles: [LocalUploadFile]
+        let remoteFiles: [FileDescriptor]
         let clipboardPath: String?
 
         if let selectedProject = project {
-            guard apiKey != nil else {
+            guard let apiKey else {
                 throw UploadError.missingAPIKey
             }
             guard let projectCacheRoot else {
                 throw UploadError.cannotBuildRequest
             }
-            clipboardPath = try stageProjectUpload(fileURLs: fileURLs, project: selectedProject, cacheRoot: projectCacheRoot)
+            if let slug = selectedProject.slug {
+                remoteFiles = try await siteManifest(slug: slug, apiKey: apiKey)
+            } else {
+                remoteFiles = []
+            }
+            let occupiedPaths = Set(remoteFiles.map(\.path))
+            clipboardPath = try stageProjectUpload(
+                fileURLs: fileURLs,
+                project: selectedProject,
+                cacheRoot: projectCacheRoot,
+                occupiedPaths: occupiedPaths
+            )
             localFiles = try collectFiles(from: [projectCacheRoot])
         } else {
+            remoteFiles = []
             clipboardPath = nil
             localFiles = try collectFiles(from: fileURLs)
         }
@@ -269,15 +304,19 @@ private final class HereNowUploader {
             throw UploadError.noFiles
         }
 
+        let localDescriptors = localFiles.map {
+            FileDescriptor(
+                path: $0.path,
+                size: $0.size,
+                contentType: $0.contentType,
+                hash: $0.hash
+            )
+        }
+        let localPaths = Set(localDescriptors.map(\.path))
+        let preservedRemoteFiles = remoteFiles.filter { !localPaths.contains($0.path) }
+
         let requestPayload = PublishRequest(
-            files: localFiles.map {
-                FileDescriptor(
-                    path: $0.path,
-                    size: $0.size,
-                    contentType: $0.contentType,
-                    hash: $0.hash
-                )
-            },
+            files: preservedRemoteFiles + localDescriptors,
             viewer: ViewerDescriptor(
                 title: project?.name ?? (localFiles.count == 1 ? localFiles[0].path : "Shared files"),
                 description: "Uploaded with HereDrop"
@@ -378,10 +417,30 @@ private final class HereNowUploader {
         return finalizeResponse.siteUrl
     }
 
-    private func stageProjectUpload(fileURLs: [URL], project: ShareProject, cacheRoot: URL) throws -> String? {
+    private func siteManifest(slug: String, apiKey: String) async throws -> [FileDescriptor] {
+        let url = AppConstants.apiBaseURL
+            .appendingPathComponent("api/v1/publish")
+            .appendingPathComponent(slug)
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue(AppConstants.clientHeader, forHTTPHeaderField: "x-herenow-client")
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "authorization")
+
+        let (data, response) = try await session.data(for: request)
+        try validateHTTP(response, data: data, context: "Get site manifest")
+        return try decodeOrThrow(SiteDetailsResponse.self, from: data).manifest
+    }
+
+    private func stageProjectUpload(
+        fileURLs: [URL],
+        project: ShareProject,
+        cacheRoot: URL,
+        occupiedPaths: Set<String>
+    ) throws -> String? {
         try FileManager.default.createDirectory(at: cacheRoot, withIntermediateDirectories: true)
 
         var usedPaths = try existingRelativePaths(in: cacheRoot)
+        usedPaths.formUnion(occupiedPaths)
         var stagedPaths: [String] = []
         let multipleRoots = fileURLs.count > 1
 
@@ -981,6 +1040,23 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AvatarViewDele
         scheduleIdleReset()
     }
 
+    @objc private func copySelectedProjectURL() {
+        guard let url = selectedProjectURL() else {
+            return
+        }
+        copyToClipboard(url)
+        avatarView?.setState(.success, text: "Copied")
+        scheduleIdleReset()
+    }
+
+    @objc private func openSelectedProjectURL() {
+        guard let value = selectedProjectURL(),
+              let url = URL(string: value) else {
+            return
+        }
+        NSWorkspace.shared.open(url)
+    }
+
     @objc private func selectQuickShare(_ sender: NSMenuItem) {
         selectedProjectID = nil
         UserDefaults.standard.removeObject(forKey: AppConstants.selectedProjectIDDefaultsKey)
@@ -1000,10 +1076,21 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AvatarViewDele
     }
 
     @objc private func createProject() {
+        showProjectEditor(title: "New Share Project", project: nil)
+    }
+
+    @objc private func editSelectedProject() {
+        guard let project = projectStore.project(id: selectedProjectID) else {
+            return
+        }
+        showProjectEditor(title: "Edit Share Project", project: project)
+    }
+
+    private func showProjectEditor(title: String, project: ShareProject?) {
         let alert = NSAlert()
-        alert.messageText = "New Share Project"
+        alert.messageText = title
         alert.informativeText = "Drop files while this project is selected to append them to one stable here.now site."
-        alert.addButton(withTitle: "Create")
+        alert.addButton(withTitle: project == nil ? "Create" : "Save")
         alert.addButton(withTitle: "Cancel")
 
         let stack = NSStackView()
@@ -1012,17 +1099,24 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AvatarViewDele
         stack.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
 
         let nameField = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        nameField.stringValue = project?.name ?? ""
         nameField.placeholderString = "Project name"
 
         let prefixField = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
-        prefixField.stringValue = "uploads"
+        prefixField.stringValue = project?.pathPrefix.trimmingCharacters(in: CharacterSet(charactersIn: "/")) ?? "uploads"
         prefixField.placeholderString = "Folder path inside the site"
+
+        let slugField = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        slugField.stringValue = project?.slug ?? ""
+        slugField.placeholderString = "Optional existing here.now slug"
 
         stack.addArrangedSubview(NSTextField(labelWithString: "Name"))
         stack.addArrangedSubview(nameField)
         stack.addArrangedSubview(NSTextField(labelWithString: "Folder path inside site"))
         stack.addArrangedSubview(prefixField)
-        stack.setFrameSize(NSSize(width: 320, height: 92))
+        stack.addArrangedSubview(NSTextField(labelWithString: "Existing slug"))
+        stack.addArrangedSubview(slugField)
+        stack.setFrameSize(NSSize(width: 320, height: 148))
         alert.accessoryView = stack
 
         guard alert.runModal() == .alertFirstButtonReturn else {
@@ -1036,9 +1130,21 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AvatarViewDele
         }
 
         do {
-            let project = try projectStore.createProject(name: name, pathPrefix: prefixField.stringValue)
-            selectedProjectID = project.id
-            UserDefaults.standard.set(project.id, forKey: AppConstants.selectedProjectIDDefaultsKey)
+            if var project {
+                project.name = name
+                project.pathPrefix = ProjectStore.normalizedPathPrefix(prefixField.stringValue)
+                project.slug = ProjectStore.normalizedSlug(slugField.stringValue)
+                project.updatedAt = Date()
+                try projectStore.updateProject(project)
+            } else {
+                let project = try projectStore.createProject(
+                    name: name,
+                    pathPrefix: prefixField.stringValue,
+                    slug: slugField.stringValue
+                )
+                selectedProjectID = project.id
+                UserDefaults.standard.set(project.id, forKey: AppConstants.selectedProjectIDDefaultsKey)
+            }
             avatarView?.setState(.idle)
             rebuildMenu()
         } catch {
@@ -1098,6 +1204,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AvatarViewDele
         let projectItem = NSMenuItem(title: "Target: \(selectedProject?.name ?? "Quick Share")", action: nil, keyEquivalent: "")
         projectItem.submenu = projectMenu(selectedProject: selectedProject)
         menu.addItem(projectItem)
+        if selectedProjectURL() != nil {
+            menu.addItem(NSMenuItem(title: "Copy Project Folder URL", action: #selector(copySelectedProjectURL), keyEquivalent: ""))
+            menu.addItem(NSMenuItem(title: "Open Project Folder", action: #selector(openSelectedProjectURL), keyEquivalent: ""))
+        }
         menu.addItem(NSMenuItem.separator())
 
         if let lastPublishedURL {
@@ -1153,8 +1263,26 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AvatarViewDele
         }
 
         menu.addItem(NSMenuItem.separator())
+        if selectedProject != nil {
+            menu.addItem(NSMenuItem(title: "Edit Selected Project...", action: #selector(editSelectedProject), keyEquivalent: ""))
+        }
         menu.addItem(NSMenuItem(title: "New Project...", action: #selector(createProject), keyEquivalent: "n"))
         return menu
+    }
+
+    private func selectedProjectURL() -> String? {
+        guard let project = projectStore.project(id: selectedProjectID),
+              let slug = project.slug,
+              !slug.isEmpty else {
+            return nil
+        }
+
+        var components = URLComponents()
+        components.scheme = "https"
+        components.host = "\(slug).here.now"
+        let prefix = project.pathPrefix.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        components.path = prefix.isEmpty ? "/" : "/\(prefix)/"
+        return components.url?.absoluteString
     }
 
     private func handleUploadSuccess(_ result: PublishResult, projectID: String?) {

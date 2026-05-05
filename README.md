@@ -103,6 +103,7 @@ Then enter:
 
 - `Name`: the label shown in the menu.
 - `Folder path inside site`: where files are placed inside that project's public site. The default is `uploads`.
+- `Existing slug`: optional. Use this when you want the project to append files to a here.now site you already own.
 
 When that project is selected, each dropped file is copied into the local project cache, the existing project site is republished, and the direct public file URL is copied to your clipboard.
 
@@ -113,6 +114,14 @@ https://bright-canvas-a7k2.here.now/uploads/screenshot.png
 ```
 
 If a project does not have a here.now slug yet, the first drop creates one and saves the slug locally. Later drops update the same site.
+
+Use this menu item to change the display name, folder path, or associated slug later:
+
+```text
+HN > Target > Edit Selected Project...
+```
+
+When a project has an existing slug, HereDrop reads the current here.now site manifest before updating it. That keeps files already on the site in the next published version while adding the newly dropped files.
 
 ## Start at Login
 
