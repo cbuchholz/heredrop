@@ -104,7 +104,7 @@ HN > Target > New Project...
 Then enter:
 
 - `Name`: the label shown in the menu.
-- `Folder path inside site`: where files are placed inside that project's public site. The default is `uploads`.
+- `Folder path inside site`: where files are placed inside that project's public site. Leave blank to upload at the site root.
 - `Existing slug`: optional. Use this when you want the project to append files to a here.now site you already own.
 
 When that project is selected, each dropped file is copied into the local project cache, the existing project site is republished, and the direct public file URL is copied to your clipboard.
@@ -112,10 +112,18 @@ When that project is selected, each dropped file is copied into the local projec
 Example copied URL:
 
 ```text
-https://bright-canvas-a7k2.here.now/uploads/screenshot.png
+https://bright-canvas-a7k2.here.now/screenshot.png
 ```
 
 If a project does not have a here.now slug yet, the first drop creates one and saves the slug locally. Later drops update the same site.
+
+Remove individual project files from:
+
+```text
+HN > Manage Project Files...
+```
+
+HereDrop fetches the current here.now manifest, lets you choose paths to remove, and republishes the same site without those paths.
 
 Use this menu item to change the display name, folder path, or associated slug later:
 
@@ -153,6 +161,12 @@ Upload through a named project target:
 
 ```bash
 dist/HereDrop.app/Contents/MacOS/HereDrop --upload --project "Project Name" path/to/file.pdf
+```
+
+Remove project files by path:
+
+```bash
+dist/HereDrop.app/Contents/MacOS/HereDrop --delete --project "Project Name" path/in/site.pdf
 ```
 
 ## Security Notes

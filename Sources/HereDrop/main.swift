@@ -21,6 +21,9 @@ private enum UploadError: LocalizedError {
     case cannotStageProject(URL)
     case cannotBuildRequest
     case missingAPIKey
+    case missingProjectSlug
+    case noFilesSelected
+    case cannotDeleteAllProjectFiles
     case unexpectedResponse(String)
     case api(String)
     case http(Int, String)
@@ -37,6 +40,12 @@ private enum UploadError: LocalizedError {
             return "Could not build the here.now request."
         case .missingAPIKey:
             return "Project uploads require HERENOW_API_KEY or ~/.herenow/credentials."
+        case .missingProjectSlug:
+            return "The selected project does not have a here.now site yet."
+        case .noFilesSelected:
+            return "No files were selected."
+        case .cannotDeleteAllProjectFiles:
+            return "Deleting every file is not supported from HereDrop. Delete the whole site from here.now instead."
         case .unexpectedResponse(let detail):
             return "Unexpected here.now response: \(detail)"
         case .api(let message):
@@ -310,6 +319,60 @@ private final class HereNowUploader {
         try await upload(fileURLs: fileURLs, project: nil, projectCacheRoot: nil)
     }
 
+    func projectFiles(project: ShareProject) async throws -> [FileDescriptor] {
+        guard let apiKey = loadAPIKey() else {
+            throw UploadError.missingAPIKey
+        }
+        guard let slug = project.slug, !slug.isEmpty else {
+            throw UploadError.missingProjectSlug
+        }
+        return try await siteManifest(slug: slug, apiKey: apiKey)
+            .sorted { $0.path.localizedCaseInsensitiveCompare($1.path) == .orderedAscending }
+    }
+
+    func deleteProjectFiles(project: ShareProject, projectCacheRoot: URL, paths: Set<String>) async throws -> Int {
+        guard let apiKey = loadAPIKey() else {
+            throw UploadError.missingAPIKey
+        }
+        guard let slug = project.slug, !slug.isEmpty else {
+            throw UploadError.missingProjectSlug
+        }
+        guard !paths.isEmpty else {
+            throw UploadError.noFilesSelected
+        }
+
+        let currentFiles = try await siteManifest(slug: slug, apiKey: apiKey)
+        let remainingFiles = currentFiles.filter { !paths.contains($0.path) }
+        guard !remainingFiles.isEmpty else {
+            throw UploadError.cannotDeleteAllProjectFiles
+        }
+
+        let requestPayload = PublishRequest(
+            files: remainingFiles,
+            viewer: ViewerDescriptor(
+                title: project.name,
+                description: "Uploaded with HereDrop"
+            )
+        )
+        let createResponse = try await createPublish(payload: requestPayload, apiKey: apiKey, slug: slug)
+
+        guard createResponse.upload.uploads.isEmpty else {
+            throw UploadError.unexpectedResponse("here.now requested upload data while deleting files")
+        }
+
+        _ = try await finalize(
+            finalizeURL: createResponse.upload.finalizeUrl,
+            versionID: createResponse.upload.versionId,
+            apiKey: apiKey
+        )
+
+        for path in paths {
+            removeCachedProjectFile(path: path, cacheRoot: projectCacheRoot)
+        }
+
+        return currentFiles.count - remainingFiles.count
+    }
+
     func upload(fileURLs: [URL], project: ShareProject?, projectCacheRoot: URL?) async throws -> PublishResult {
         let apiKey = loadAPIKey()
         var project = project
@@ -577,6 +640,34 @@ private final class HereNowUploader {
             try FileManager.default.copyItem(at: sourceURL, to: destinationURL)
         } catch {
             throw UploadError.cannotStageProject(sourceURL)
+        }
+    }
+
+    private func removeCachedProjectFile(path: String, cacheRoot: URL) {
+        let destinationURL = path.split(separator: "/").reduce(cacheRoot) { partialURL, component in
+            partialURL.appendingPathComponent(String(component))
+        }
+        guard destinationURL.standardizedFileURL.path.hasPrefix(cacheRoot.standardizedFileURL.path + "/") else {
+            return
+        }
+        try? FileManager.default.removeItem(at: destinationURL)
+        removeEmptyParentDirectories(startingAt: destinationURL.deletingLastPathComponent(), cacheRoot: cacheRoot)
+    }
+
+    private func removeEmptyParentDirectories(startingAt directoryURL: URL, cacheRoot: URL) {
+        var currentURL = directoryURL.standardizedFileURL
+        let rootURL = cacheRoot.standardizedFileURL
+
+        while currentURL.path.hasPrefix(rootURL.path),
+              currentURL.path != rootURL.path {
+            guard let contents = try? FileManager.default.contentsOfDirectory(
+                at: currentURL,
+                includingPropertiesForKeys: nil
+            ), contents.isEmpty else {
+                return
+            }
+            try? FileManager.default.removeItem(at: currentURL)
+            currentURL.deleteLastPathComponent()
         }
     }
 
@@ -1125,6 +1216,37 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AvatarViewDele
         NSWorkspace.shared.open(url)
     }
 
+    @objc private func manageSelectedProjectFiles() {
+        guard let project = projectStore.project(id: selectedProjectID),
+              let slug = project.slug,
+              !slug.isEmpty else {
+            handleUploadFailure(UploadError.missingProjectSlug)
+            return
+        }
+
+        isUploading = true
+        lastError = nil
+        avatarView?.setState(.uploading, text: "Files")
+        rebuildMenu()
+        AppLogger.info("Loading project file manager for project=\(project.name)")
+
+        Task.detached(priority: .userInitiated) { [project] in
+            do {
+                let files = try await HereNowUploader().projectFiles(project: project)
+                await MainActor.run {
+                    self.isUploading = false
+                    self.avatarView?.setState(.idle)
+                    self.showProjectFileManager(project: project, files: files)
+                    self.rebuildMenu()
+                }
+            } catch {
+                await MainActor.run {
+                    self.handleUploadFailure(error)
+                }
+            }
+        }
+    }
+
     @objc private func selectQuickShare(_ sender: NSMenuItem) {
         selectedProjectID = nil
         UserDefaults.standard.removeObject(forKey: AppConstants.selectedProjectIDDefaultsKey)
@@ -1173,7 +1295,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AvatarViewDele
         stack.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
 
         let resolvedName = project?.name ?? "New Project"
-        let resolvedPrefix = project?.pathPrefix.trimmingCharacters(in: CharacterSet(charactersIn: "/")) ?? "uploads"
+        let resolvedPrefix = project?.pathPrefix.trimmingCharacters(in: CharacterSet(charactersIn: "/")) ?? ""
         let resolvedSlug = project?.slug ?? ""
 
         let nameField = NSTextField(frame: NSRect(x: 0, y: 0, width: 380, height: 24))
@@ -1230,6 +1352,103 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AvatarViewDele
             rebuildMenu()
         } catch {
             handleUploadFailure(error)
+        }
+    }
+
+    private func showProjectFileManager(project: ShareProject, files: [FileDescriptor]) {
+        guard !files.isEmpty else {
+            let alert = NSAlert()
+            alert.messageText = "No Project Files"
+            alert.informativeText = "The selected here.now site does not currently list any files."
+            alert.addButton(withTitle: "OK")
+            alert.window.level = .floating
+            alert.runModal()
+            return
+        }
+
+        NSApp.activate(ignoringOtherApps: true)
+        panel?.orderFrontRegardless()
+
+        let alert = NSAlert()
+        alert.messageText = "Manage Project Files"
+        alert.informativeText = "Select files to remove from \(project.name). HereDrop republishes the same site without the selected paths."
+        alert.addButton(withTitle: "Delete Selected")
+        alert.addButton(withTitle: "Cancel")
+
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 6
+
+        var checkboxes: [(path: String, checkbox: NSButton)] = []
+        for file in files {
+            let checkbox = NSButton(checkboxWithTitle: file.path, target: nil, action: nil)
+            checkbox.lineBreakMode = .byTruncatingMiddle
+            checkbox.toolTip = file.path
+            checkbox.setFrameSize(NSSize(width: 520, height: 22))
+            stack.addArrangedSubview(checkbox)
+            checkboxes.append((file.path, checkbox))
+        }
+
+        let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: 540, height: min(360, max(120, files.count * 28))))
+        scrollView.hasVerticalScroller = true
+        scrollView.documentView = stack
+        stack.setFrameSize(NSSize(width: 520, height: max(120, files.count * 28)))
+        alert.accessoryView = scrollView
+        alert.window.level = .floating
+
+        guard alert.runModal() == .alertFirstButtonReturn else {
+            AppLogger.info("Project file manager cancelled project=\(project.name)")
+            return
+        }
+
+        let selectedPaths = Set(checkboxes.compactMap { path, checkbox in
+            checkbox.state == .on ? path : nil
+        })
+        guard !selectedPaths.isEmpty else {
+            NSSound.beep()
+            return
+        }
+
+        let confirm = NSAlert()
+        confirm.alertStyle = .warning
+        confirm.messageText = "Delete \(selectedPaths.count) File\(selectedPaths.count == 1 ? "" : "s")?"
+        confirm.informativeText = "This removes the selected paths from the public here.now site by publishing a new version."
+        confirm.addButton(withTitle: "Delete")
+        confirm.addButton(withTitle: "Cancel")
+        confirm.window.level = .floating
+
+        guard confirm.runModal() == .alertFirstButtonReturn else {
+            AppLogger.info("Project file delete cancelled project=\(project.name) count=\(selectedPaths.count)")
+            return
+        }
+
+        deleteProjectFiles(project: project, paths: selectedPaths)
+    }
+
+    private func deleteProjectFiles(project: ShareProject, paths: Set<String>) {
+        isUploading = true
+        lastError = nil
+        avatarView?.setState(.uploading, text: "Deleting")
+        rebuildMenu()
+        AppLogger.info("Deleting project files project=\(project.name) paths=\(paths.sorted().joined(separator: ","))")
+
+        let cacheRoot = projectStore.cacheRoot(for: project)
+        Task.detached(priority: .userInitiated) {
+            do {
+                let deletedCount = try await HereNowUploader().deleteProjectFiles(
+                    project: project,
+                    projectCacheRoot: cacheRoot,
+                    paths: paths
+                )
+                await MainActor.run {
+                    self.handleProjectDeleteSuccess(project: project, deletedCount: deletedCount)
+                }
+            } catch {
+                await MainActor.run {
+                    self.handleUploadFailure(error)
+                }
+            }
         }
     }
 
@@ -1298,6 +1517,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AvatarViewDele
         }
         menu.addItem(actionItem(title: "New Project...", action: #selector(createProject), keyEquivalent: "n"))
         if selectedProjectURL() != nil {
+            menu.addItem(actionItem(title: "Manage Project Files...", action: #selector(manageSelectedProjectFiles)))
             menu.addItem(actionItem(title: "Copy Project Folder URL", action: #selector(copySelectedProjectURL)))
             menu.addItem(actionItem(title: "Open Project Folder", action: #selector(openSelectedProjectURL)))
         }
@@ -1347,6 +1567,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AvatarViewDele
         menu.addItem(NSMenuItem.separator())
         if selectedProject != nil {
             menu.addItem(actionItem(title: "Edit Selected Project...", action: #selector(editSelectedProject)))
+            if let slug = selectedProject?.slug, !slug.isEmpty {
+                menu.addItem(actionItem(title: "Manage Project Files...", action: #selector(manageSelectedProjectFiles)))
+            }
         }
         menu.addItem(actionItem(title: "New Project...", action: #selector(createProject), keyEquivalent: "n"))
         return menu
@@ -1421,6 +1644,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AvatarViewDele
         copyToClipboard(result.clipboardURL)
         AppLogger.info("Upload succeeded target=\(result.projectName ?? "Quick Share") url=\(result.clipboardURL) files=\(result.fileCount)")
         avatarView?.setState(.success, text: result.projectName ?? "Copied")
+        NSSound(named: "Glass")?.play()
+        rebuildMenu()
+        scheduleIdleReset()
+    }
+
+    private func handleProjectDeleteSuccess(project: ShareProject, deletedCount: Int) {
+        isUploading = false
+        lastError = nil
+        avatarView?.setState(.success, text: "Deleted")
+        AppLogger.info("Project file delete succeeded project=\(project.name) count=\(deletedCount)")
         NSSound(named: "Glass")?.play()
         rebuildMenu()
         scheduleIdleReset()
@@ -1553,10 +1786,67 @@ private func runCommandLineUpload(arguments: [String]) -> Bool {
     return true
 }
 
+@MainActor
+private func runCommandLineDelete(arguments: [String]) -> Bool {
+    guard let deleteIndex = arguments.firstIndex(of: "--delete") else {
+        return false
+    }
+
+    var projectIdentifier: String?
+    var paths: [String] = []
+    var remaining = Array(arguments.dropFirst(deleteIndex + 1))
+    while !remaining.isEmpty {
+        let value = remaining.removeFirst()
+        if value == "--project" {
+            guard !remaining.isEmpty else {
+                fputs("usage: HereDrop --delete --project <name-or-id> <site-path> [more-paths]\n", stderr)
+                exit(2)
+            }
+            projectIdentifier = remaining.removeFirst()
+        } else {
+            paths.append(value)
+        }
+    }
+
+    guard let projectIdentifier, !paths.isEmpty else {
+        fputs("usage: HereDrop --delete --project <name-or-id> <site-path> [more-paths]\n", stderr)
+        exit(2)
+    }
+
+    let projectStore = ProjectStore()
+    guard let project = projectStore.projects.first(where: {
+        $0.id == projectIdentifier || $0.name.localizedCaseInsensitiveCompare(projectIdentifier) == .orderedSame
+    }) else {
+        fputs("error: project not found: \(projectIdentifier)\n", stderr)
+        exit(2)
+    }
+
+    let cacheRoot = projectStore.cacheRoot(for: project)
+    Task.detached(priority: .userInitiated) {
+        do {
+            let deletedCount = try await HereNowUploader().deleteProjectFiles(
+                project: project,
+                projectCacheRoot: cacheRoot,
+                paths: Set(paths)
+            )
+            print("deleted \(deletedCount) file\(deletedCount == 1 ? "" : "s")")
+            exit(0)
+        } catch {
+            fputs("error: \(error.localizedDescription)\n", stderr)
+            exit(1)
+        }
+    }
+    RunLoop.main.run()
+    return true
+}
+
 @main
 @MainActor
 private struct HereDropMain {
     static func main() {
+        if runCommandLineDelete(arguments: CommandLine.arguments) {
+            return
+        }
         if runCommandLineUpload(arguments: CommandLine.arguments) {
             return
         }
