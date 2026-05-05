@@ -138,6 +138,49 @@ private struct ProjectsFile: Codable {
     var projects: [ShareProject]
 }
 
+private enum AppLogger {
+    private static let queue = DispatchQueue(label: "com.cortbuchholz.heredrop.logging")
+
+    static var logURL: URL {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
+        return appSupport
+            .appendingPathComponent(AppConstants.applicationSupportFolderName, isDirectory: true)
+            .appendingPathComponent("HereDrop.log")
+    }
+
+    static func info(_ message: String) {
+        write("INFO", message)
+    }
+
+    static func error(_ message: String) {
+        write("ERROR", message)
+    }
+
+    private static func write(_ level: String, _ message: String) {
+        let line = "\(ISO8601DateFormatter().string(from: Date())) [\(level)] \(message)\n"
+        queue.async {
+            do {
+                let url = logURL
+                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                let data = Data(line.utf8)
+                if FileManager.default.fileExists(atPath: url.path),
+                   let handle = try? FileHandle(forWritingTo: url) {
+                    defer {
+                        try? handle.close()
+                    }
+                    try handle.seekToEnd()
+                    try handle.write(contentsOf: data)
+                } else {
+                    try data.write(to: url, options: [.atomic])
+                }
+            } catch {
+                NSLog("HereDrop log write failed: %@", error.localizedDescription)
+            }
+        }
+    }
+}
+
 private final class ProjectStore {
     private(set) var projects: [ShareProject] = []
     let rootURL: URL
@@ -751,6 +794,7 @@ private enum AvatarState: Equatable {
 private protocol AvatarViewDelegate: AnyObject {
     func avatarView(_ avatarView: AvatarView, didReceiveFileURLs urls: [URL])
     func avatarViewDidMove(_ avatarView: AvatarView)
+    func avatarViewContextMenu(_ avatarView: AvatarView) -> NSMenu
 }
 
 @MainActor
@@ -761,6 +805,7 @@ private final class AvatarView: NSView {
     private var statusText: String = ""
     private var dragStartMouseLocation: NSPoint?
     private var dragStartWindowOrigin: NSPoint?
+    private var didDragWindow = false
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -905,6 +950,7 @@ private final class AvatarView: NSView {
     override func mouseDown(with event: NSEvent) {
         dragStartMouseLocation = NSEvent.mouseLocation
         dragStartWindowOrigin = window?.frame.origin
+        didDragWindow = false
     }
 
     override func mouseDragged(with event: NSEvent) {
@@ -919,17 +965,27 @@ private final class AvatarView: NSView {
             x: startOrigin.x + currentMouse.x - startMouse.x,
             y: startOrigin.y + currentMouse.y - startMouse.y
         )
+        if abs(currentMouse.x - startMouse.x) > 3 || abs(currentMouse.y - startMouse.y) > 3 {
+            didDragWindow = true
+        }
         window.setFrameOrigin(nextOrigin)
     }
 
     override func mouseUp(with event: NSEvent) {
-        delegate?.avatarViewDidMove(self)
+        if didDragWindow {
+            delegate?.avatarViewDidMove(self)
+        } else if let menu = delegate?.avatarViewContextMenu(self) {
+            NSMenu.popUpContextMenu(menu, with: event, for: self)
+        }
         dragStartMouseLocation = nil
         dragStartWindowOrigin = nil
+        didDragWindow = false
     }
 
     override func rightMouseDown(with event: NSEvent) {
-        NSApp.sendAction(#selector(AppDelegate.showStatusMenuFromAvatar), to: nil, from: self)
+        if let menu = delegate?.avatarViewContextMenu(self) {
+            NSMenu.popUpContextMenu(menu, with: event, for: self)
+        }
     }
 
     private func fileURLs(from pasteboard: NSPasteboard) -> [URL] {
@@ -955,6 +1011,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AvatarViewDele
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        AppLogger.info("HereDrop launched from \(Bundle.main.bundlePath)")
         lastPublishedURL = UserDefaults.standard.string(forKey: AppConstants.lastURLDefaultsKey)
         lastClaimURL = UserDefaults.standard.string(forKey: AppConstants.lastClaimURLDefaultsKey)
         selectedProjectID = UserDefaults.standard.string(forKey: AppConstants.selectedProjectIDDefaultsKey)
@@ -972,6 +1029,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AvatarViewDele
 
     func avatarView(_ avatarView: AvatarView, didReceiveFileURLs urls: [URL]) {
         guard !isUploading else {
+            AppLogger.info("Ignored drop while upload already in progress")
             return
         }
 
@@ -979,6 +1037,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AvatarViewDele
         lastError = nil
         let selectedProject = projectStore.project(id: selectedProjectID)
         let projectCacheRoot = selectedProject.map { projectStore.cacheRoot(for: $0) }
+        AppLogger.info("Drop received files=\(urls.map(\.lastPathComponent).joined(separator: ",")) target=\(selectedProject?.name ?? "Quick Share") slug=\(selectedProject?.slug ?? "none")")
         avatarView.setState(.uploading, text: selectedProject?.name ?? "Uploading")
         rebuildMenu()
 
@@ -1005,6 +1064,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AvatarViewDele
             return
         }
         UserDefaults.standard.set(NSStringFromRect(frame), forKey: AppConstants.frameDefaultsKey)
+        AppLogger.info("Avatar moved to \(NSStringFromRect(frame))")
+    }
+
+    func avatarViewContextMenu(_ avatarView: AvatarView) -> NSMenu {
+        AppLogger.info("Avatar context menu requested")
+        return makeMenu()
     }
 
     @objc func showStatusMenuFromAvatar() {
@@ -1019,6 +1084,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AvatarViewDele
             return
         }
         copyToClipboard(lastPublishedURL)
+        AppLogger.info("Copied last URL")
         avatarView?.setState(.success, text: "Copied")
         scheduleIdleReset()
     }
@@ -1036,6 +1102,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AvatarViewDele
             return
         }
         copyToClipboard(lastClaimURL)
+        AppLogger.info("Copied claim URL")
         avatarView?.setState(.success, text: "Claim")
         scheduleIdleReset()
     }
@@ -1045,6 +1112,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AvatarViewDele
             return
         }
         copyToClipboard(url)
+        AppLogger.info("Copied selected project folder URL")
         avatarView?.setState(.success, text: "Copied")
         scheduleIdleReset()
     }
@@ -1060,6 +1128,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AvatarViewDele
     @objc private func selectQuickShare(_ sender: NSMenuItem) {
         selectedProjectID = nil
         UserDefaults.standard.removeObject(forKey: AppConstants.selectedProjectIDDefaultsKey)
+        AppLogger.info("Selected Quick Share target")
         avatarView?.setState(.idle)
         rebuildMenu()
     }
@@ -1071,6 +1140,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AvatarViewDele
         }
         selectedProjectID = projectID
         UserDefaults.standard.set(projectID, forKey: AppConstants.selectedProjectIDDefaultsKey)
+        AppLogger.info("Selected project id=\(projectID)")
         avatarView?.setState(.idle)
         rebuildMenu()
     }
@@ -1087,6 +1157,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AvatarViewDele
     }
 
     private func showProjectEditor(title: String, project: ShareProject?) {
+        AppLogger.info("Opening project editor title=\(title) project=\(project?.name ?? "new")")
+        NSApp.activate(ignoringOtherApps: true)
+        panel?.orderFrontRegardless()
+
         let alert = NSAlert()
         alert.messageText = title
         alert.informativeText = "Drop files while this project is selected to append them to one stable here.now site."
@@ -1098,16 +1172,17 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AvatarViewDele
         stack.spacing = 8
         stack.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
 
-        let nameField = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
-        nameField.stringValue = project?.name ?? ""
+        let resolvedName = project?.name ?? "New Project"
+        let resolvedPrefix = project?.pathPrefix.trimmingCharacters(in: CharacterSet(charactersIn: "/")) ?? "uploads"
+        let resolvedSlug = project?.slug ?? ""
+
+        let nameField = NSTextField(frame: NSRect(x: 0, y: 0, width: 380, height: 24))
         nameField.placeholderString = "Project name"
 
-        let prefixField = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
-        prefixField.stringValue = project?.pathPrefix.trimmingCharacters(in: CharacterSet(charactersIn: "/")) ?? "uploads"
+        let prefixField = NSTextField(frame: NSRect(x: 0, y: 0, width: 380, height: 24))
         prefixField.placeholderString = "Folder path inside the site"
 
-        let slugField = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
-        slugField.stringValue = project?.slug ?? ""
+        let slugField = NSTextField(frame: NSRect(x: 0, y: 0, width: 380, height: 24))
         slugField.placeholderString = "Optional existing here.now slug"
 
         stack.addArrangedSubview(NSTextField(labelWithString: "Name"))
@@ -1116,10 +1191,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AvatarViewDele
         stack.addArrangedSubview(prefixField)
         stack.addArrangedSubview(NSTextField(labelWithString: "Existing slug"))
         stack.addArrangedSubview(slugField)
-        stack.setFrameSize(NSSize(width: 320, height: 148))
+        stack.setFrameSize(NSSize(width: 380, height: 170))
         alert.accessoryView = stack
+        nameField.stringValue = resolvedName
+        prefixField.stringValue = resolvedPrefix
+        slugField.stringValue = resolvedSlug
+        alert.window.level = .floating
 
         guard alert.runModal() == .alertFirstButtonReturn else {
+            AppLogger.info("Project editor cancelled")
             return
         }
 
@@ -1145,6 +1225,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AvatarViewDele
                 selectedProjectID = project.id
                 UserDefaults.standard.set(project.id, forKey: AppConstants.selectedProjectIDDefaultsKey)
             }
+            AppLogger.info("Saved project name=\(name) slug=\(ProjectStore.normalizedSlug(slugField.stringValue) ?? "none")")
             avatarView?.setState(.idle)
             rebuildMenu()
         } catch {
@@ -1194,6 +1275,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AvatarViewDele
     }
 
     private func rebuildMenu() {
+        statusItem?.menu = makeMenu()
+    }
+
+    private func makeMenu() -> NSMenu {
         let menu = NSMenu()
 
         let titleItem = NSMenuItem(title: isUploading ? "HereDrop: uploading" : "HereDrop", action: nil, keyEquivalent: "")
@@ -1204,9 +1289,17 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AvatarViewDele
         let projectItem = NSMenuItem(title: "Target: \(selectedProject?.name ?? "Quick Share")", action: nil, keyEquivalent: "")
         projectItem.submenu = projectMenu(selectedProject: selectedProject)
         menu.addItem(projectItem)
+        menu.addItem(targetQuickShareItem(selectedProject: selectedProject))
+        for project in projectStore.projects {
+            menu.addItem(targetProjectItem(project, selectedProject: selectedProject))
+        }
+        if selectedProject != nil {
+            menu.addItem(actionItem(title: "Edit Selected Project...", action: #selector(editSelectedProject)))
+        }
+        menu.addItem(actionItem(title: "New Project...", action: #selector(createProject), keyEquivalent: "n"))
         if selectedProjectURL() != nil {
-            menu.addItem(NSMenuItem(title: "Copy Project Folder URL", action: #selector(copySelectedProjectURL), keyEquivalent: ""))
-            menu.addItem(NSMenuItem(title: "Open Project Folder", action: #selector(openSelectedProjectURL), keyEquivalent: ""))
+            menu.addItem(actionItem(title: "Copy Project Folder URL", action: #selector(copySelectedProjectURL)))
+            menu.addItem(actionItem(title: "Open Project Folder", action: #selector(openSelectedProjectURL)))
         }
         menu.addItem(NSMenuItem.separator())
 
@@ -1215,12 +1308,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AvatarViewDele
             let lastURLItem = NSMenuItem(title: displayURL, action: nil, keyEquivalent: "")
             lastURLItem.isEnabled = false
             menu.addItem(lastURLItem)
-            menu.addItem(NSMenuItem(title: "Copy Last URL", action: #selector(copyLastURL), keyEquivalent: "c"))
-            menu.addItem(NSMenuItem(title: "Open Last URL", action: #selector(openLastURL), keyEquivalent: "o"))
+            menu.addItem(actionItem(title: "Copy Last URL", action: #selector(copyLastURL), keyEquivalent: "c"))
+            menu.addItem(actionItem(title: "Open Last URL", action: #selector(openLastURL), keyEquivalent: "o"))
         }
 
         if lastClaimURL != nil {
-            menu.addItem(NSMenuItem(title: "Copy Claim URL", action: #selector(copyClaimURL), keyEquivalent: ""))
+            menu.addItem(actionItem(title: "Copy Claim URL", action: #selector(copyClaimURL)))
             let claimItem = NSMenuItem(title: "Anonymous uploads expire in 24h", action: nil, keyEquivalent: "")
             claimItem.isEnabled = false
             menu.addItem(claimItem)
@@ -1233,41 +1326,55 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AvatarViewDele
         }
 
         menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "Show Avatar", action: #selector(showAvatar), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Quit HereDrop", action: #selector(quit), keyEquivalent: "q"))
-        statusItem?.menu = menu
+        menu.addItem(actionItem(title: "Show Avatar", action: #selector(showAvatar)))
+        menu.addItem(actionItem(title: "Quit HereDrop", action: #selector(quit), keyEquivalent: "q"))
+        return menu
     }
 
     private func projectMenu(selectedProject: ShareProject?) -> NSMenu {
         let menu = NSMenu()
 
-        let quickItem = NSMenuItem(title: "Quick Share", action: #selector(selectQuickShare), keyEquivalent: "")
-        quickItem.state = selectedProject == nil ? .on : .off
-        menu.addItem(quickItem)
+        menu.addItem(targetQuickShareItem(selectedProject: selectedProject))
 
         if !projectStore.projects.isEmpty {
             menu.addItem(NSMenuItem.separator())
         }
 
         for project in projectStore.projects {
-            let title: String
-            if let slug = project.slug, !slug.isEmpty {
-                title = "\(project.name) (\(slug))"
-            } else {
-                title = "\(project.name) (new site on next drop)"
-            }
-            let item = NSMenuItem(title: title, action: #selector(selectProject), keyEquivalent: "")
-            item.representedObject = project.id
-            item.state = selectedProject?.id == project.id ? .on : .off
-            menu.addItem(item)
+            menu.addItem(targetProjectItem(project, selectedProject: selectedProject))
         }
 
         menu.addItem(NSMenuItem.separator())
         if selectedProject != nil {
-            menu.addItem(NSMenuItem(title: "Edit Selected Project...", action: #selector(editSelectedProject), keyEquivalent: ""))
+            menu.addItem(actionItem(title: "Edit Selected Project...", action: #selector(editSelectedProject)))
         }
-        menu.addItem(NSMenuItem(title: "New Project...", action: #selector(createProject), keyEquivalent: "n"))
+        menu.addItem(actionItem(title: "New Project...", action: #selector(createProject), keyEquivalent: "n"))
         return menu
+    }
+
+    private func targetQuickShareItem(selectedProject: ShareProject?) -> NSMenuItem {
+        let item = actionItem(title: "Use Quick Share", action: #selector(selectQuickShare))
+        item.state = selectedProject == nil ? .on : .off
+        return item
+    }
+
+    private func targetProjectItem(_ project: ShareProject, selectedProject: ShareProject?) -> NSMenuItem {
+        let title: String
+        if let slug = project.slug, !slug.isEmpty {
+            title = "Use \(project.name) (\(slug))"
+        } else {
+            title = "Use \(project.name) (new site on next drop)"
+        }
+        let item = actionItem(title: title, action: #selector(selectProject))
+        item.representedObject = project.id
+        item.state = selectedProject?.id == project.id ? .on : .off
+        return item
+    }
+
+    private func actionItem(title: String, action: Selector, keyEquivalent: String = "") -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: keyEquivalent)
+        item.target = self
+        return item
     }
 
     private func selectedProjectURL() -> String? {
@@ -1312,6 +1419,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AvatarViewDele
         }
 
         copyToClipboard(result.clipboardURL)
+        AppLogger.info("Upload succeeded target=\(result.projectName ?? "Quick Share") url=\(result.clipboardURL) files=\(result.fileCount)")
         avatarView?.setState(.success, text: result.projectName ?? "Copied")
         NSSound(named: "Glass")?.play()
         rebuildMenu()
@@ -1321,6 +1429,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AvatarViewDele
     private func handleUploadFailure(_ error: Error) {
         isUploading = false
         lastError = error.localizedDescription
+        AppLogger.error("Upload failed: \(error.localizedDescription)")
         avatarView?.setState(.failure, text: "Failed")
         NSSound(named: "Basso")?.play()
         rebuildMenu()
@@ -1376,20 +1485,58 @@ private func runCommandLineUpload(arguments: [String]) -> Bool {
     guard let uploadIndex = arguments.firstIndex(of: "--upload") else {
         return false
     }
-    let paths = arguments.dropFirst(uploadIndex + 1).map { $0 }
+    var projectIdentifier: String?
+    var paths: [String] = []
+    var remaining = Array(arguments.dropFirst(uploadIndex + 1))
+    while !remaining.isEmpty {
+        let value = remaining.removeFirst()
+        if value == "--project" {
+            guard !remaining.isEmpty else {
+                fputs("usage: HereDrop --upload [--project <name-or-id>] <file-or-dir> [more-files]\n", stderr)
+                exit(2)
+            }
+            projectIdentifier = remaining.removeFirst()
+        } else {
+            paths.append(value)
+        }
+    }
     guard !paths.isEmpty else {
-        fputs("usage: HereDrop --upload <file-or-dir> [more-files]\n", stderr)
+        fputs("usage: HereDrop --upload [--project <name-or-id>] <file-or-dir> [more-files]\n", stderr)
         exit(2)
     }
 
     let urls = paths.map { URL(fileURLWithPath: $0).standardizedFileURL }
+    let projectStore = ProjectStore()
+    let project = projectIdentifier.flatMap { identifier in
+        projectStore.projects.first {
+            $0.id == identifier || $0.name.localizedCaseInsensitiveCompare(identifier) == .orderedSame
+        }
+    }
+    if projectIdentifier != nil && project == nil {
+        fputs("error: project not found: \(projectIdentifier ?? "")\n", stderr)
+        exit(2)
+    }
+    let projectCacheRoot = project.map { projectStore.cacheRoot(for: $0) }
+
     Task.detached(priority: .userInitiated) {
         do {
-            let result = try await HereNowUploader().upload(fileURLs: urls)
-            print(result.siteURL)
+            let result = try await HereNowUploader().upload(
+                fileURLs: urls,
+                project: project,
+                projectCacheRoot: projectCacheRoot
+            )
+            print(result.clipboardURL)
             await MainActor.run {
+                if let projectID = project?.id,
+                   let slug = result.slug,
+                   var updatedProject = projectStore.project(id: projectID),
+                   updatedProject.slug != slug {
+                    updatedProject.slug = slug
+                    updatedProject.updatedAt = Date()
+                    try? projectStore.updateProject(updatedProject)
+                }
                 NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(result.siteURL, forType: .string)
+                NSPasteboard.general.setString(result.clipboardURL, forType: .string)
             }
             if let claimURL = result.claimURL {
                 fputs("anonymous publish expires in 24h\nclaim URL: \(claimURL)\n", stderr)

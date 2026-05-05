@@ -56,6 +56,8 @@ You should see:
 
 Drag the avatar to reposition it. Drop a file or folder onto it to upload. Right-click the avatar, or use the status bar item, to access the menu.
 
+A normal click on the avatar also opens the menu. Dragging still moves the avatar.
+
 ## Configure here.now Credentials
 
 HereDrop reads the API key from these locations, in order:
@@ -147,6 +149,12 @@ dist/HereDrop.app/Contents/MacOS/HereDrop --upload path/to/file.pdf
 
 It prints the public URL and copies it to the clipboard.
 
+Upload through a named project target:
+
+```bash
+dist/HereDrop.app/Contents/MacOS/HereDrop --upload --project "Project Name" path/to/file.pdf
+```
+
 ## Security Notes
 
 - Public here.now URLs are public internet URLs. Anyone with the URL can access the uploaded file unless you add protection outside this app.
@@ -179,4 +187,10 @@ Check tracked files:
 
 ```bash
 git ls-files
+```
+
+Runtime logs are written to:
+
+```text
+~/Library/Application Support/HereDrop/HereDrop.log
 ```
