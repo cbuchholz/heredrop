@@ -11,12 +11,16 @@ private enum AppConstants {
     static let frameDefaultsKey = "avatarFrame"
     static let lastURLDefaultsKey = "lastPublishedURL"
     static let lastClaimURLDefaultsKey = "lastClaimURL"
+    static let selectedProjectIDDefaultsKey = "selectedProjectID"
+    static let applicationSupportFolderName = "HereDrop"
 }
 
 private enum UploadError: LocalizedError {
     case noFiles
     case cannotReadFile(URL)
+    case cannotStageProject(URL)
     case cannotBuildRequest
+    case missingAPIKey
     case unexpectedResponse(String)
     case api(String)
     case http(Int, String)
@@ -27,8 +31,12 @@ private enum UploadError: LocalizedError {
             return "No readable files were dropped."
         case .cannotReadFile(let url):
             return "Cannot read \(url.lastPathComponent)."
+        case .cannotStageProject(let url):
+            return "Could not stage \(url.lastPathComponent) for the selected project."
         case .cannotBuildRequest:
             return "Could not build the here.now request."
+        case .missingAPIKey:
+            return "Project uploads require HERENOW_API_KEY or ~/.herenow/credentials."
         case .unexpectedResponse(let detail):
             return "Unexpected here.now response: \(detail)"
         case .api(let message):
@@ -102,10 +110,126 @@ private struct FinalizeResponse: Decodable {
 
 private struct PublishResult: Sendable {
     let siteURL: String
+    let clipboardURL: String
+    let slug: String?
     let claimURL: String?
     let expiresAt: String?
     let isAuthenticated: Bool
     let fileCount: Int
+    let projectName: String?
+}
+
+private struct ShareProject: Codable, Equatable, Identifiable, Sendable {
+    let id: String
+    var name: String
+    var slug: String?
+    var pathPrefix: String
+    var createdAt: Date
+    var updatedAt: Date
+}
+
+private struct ProjectsFile: Codable {
+    var projects: [ShareProject]
+}
+
+private final class ProjectStore {
+    private(set) var projects: [ShareProject] = []
+    let rootURL: URL
+    private let configURL: URL
+
+    init(fileManager: FileManager = .default) {
+        let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
+        rootURL = appSupport.appendingPathComponent(AppConstants.applicationSupportFolderName, isDirectory: true)
+        configURL = rootURL.appendingPathComponent("projects.json")
+        load()
+    }
+
+    func load() {
+        guard let data = try? Data(contentsOf: configURL),
+              let decoded = try? JSONDecoder().decode(ProjectsFile.self, from: data) else {
+            projects = []
+            return
+        }
+        projects = decoded.projects.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    func createProject(name: String, pathPrefix: String) throws -> ShareProject {
+        let now = Date()
+        let project = ShareProject(
+            id: UUID().uuidString,
+            name: name.trimmingCharacters(in: .whitespacesAndNewlines),
+            slug: nil,
+            pathPrefix: Self.normalizedPathPrefix(pathPrefix),
+            createdAt: now,
+            updatedAt: now
+        )
+        projects.append(project)
+        sortProjects()
+        try save()
+        return project
+    }
+
+    func updateProject(_ project: ShareProject) throws {
+        guard let index = projects.firstIndex(where: { $0.id == project.id }) else {
+            return
+        }
+        projects[index] = project
+        sortProjects()
+        try save()
+    }
+
+    func project(id: String?) -> ShareProject? {
+        guard let id else {
+            return nil
+        }
+        return projects.first { $0.id == id }
+    }
+
+    func cacheRoot(for project: ShareProject) -> URL {
+        rootURL
+            .appendingPathComponent("Projects", isDirectory: true)
+            .appendingPathComponent(project.id, isDirectory: true)
+            .appendingPathComponent("site", isDirectory: true)
+    }
+
+    static func normalizedPathPrefix(_ value: String) -> String {
+        var prefix = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        while prefix.hasPrefix("/") {
+            prefix.removeFirst()
+        }
+        while prefix.hasSuffix("/") {
+            prefix.removeLast()
+        }
+        guard !prefix.isEmpty else {
+            return ""
+        }
+        return prefix
+            .split(separator: "/")
+            .map { sanitizePathComponent(String($0)) }
+            .joined(separator: "/") + "/"
+    }
+
+    static func sanitizePathComponent(_ component: String) -> String {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_. "))
+        let scalars = component.unicodeScalars.map { allowed.contains($0) ? Character($0) : "-" }
+        let cleaned = String(scalars)
+            .replacingOccurrences(of: "/", with: "-")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.isEmpty ? "file" : cleaned
+    }
+
+    private func save() throws {
+        try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(ProjectsFile(projects: projects))
+        try data.write(to: configURL, options: [.atomic])
+    }
+
+    private func sortProjects() {
+        projects.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
 }
 
 private final class HereNowUploader {
@@ -118,12 +242,33 @@ private final class HereNowUploader {
     }
 
     func upload(fileURLs: [URL]) async throws -> PublishResult {
-        let localFiles = try collectFiles(from: fileURLs)
+        try await upload(fileURLs: fileURLs, project: nil, projectCacheRoot: nil)
+    }
+
+    func upload(fileURLs: [URL], project: ShareProject?, projectCacheRoot: URL?) async throws -> PublishResult {
+        let apiKey = loadAPIKey()
+        var project = project
+        let localFiles: [LocalUploadFile]
+        let clipboardPath: String?
+
+        if let selectedProject = project {
+            guard apiKey != nil else {
+                throw UploadError.missingAPIKey
+            }
+            guard let projectCacheRoot else {
+                throw UploadError.cannotBuildRequest
+            }
+            clipboardPath = try stageProjectUpload(fileURLs: fileURLs, project: selectedProject, cacheRoot: projectCacheRoot)
+            localFiles = try collectFiles(from: [projectCacheRoot])
+        } else {
+            clipboardPath = nil
+            localFiles = try collectFiles(from: fileURLs)
+        }
+
         guard !localFiles.isEmpty else {
             throw UploadError.noFiles
         }
 
-        let apiKey = loadAPIKey()
         let requestPayload = PublishRequest(
             files: localFiles.map {
                 FileDescriptor(
@@ -134,12 +279,15 @@ private final class HereNowUploader {
                 )
             },
             viewer: ViewerDescriptor(
-                title: localFiles.count == 1 ? localFiles[0].path : "Shared files",
+                title: project?.name ?? (localFiles.count == 1 ? localFiles[0].path : "Shared files"),
                 description: "Uploaded with HereDrop"
             )
         )
 
-        let createResponse = try await createPublish(payload: requestPayload, apiKey: apiKey)
+        let createResponse = try await createPublish(payload: requestPayload, apiKey: apiKey, slug: project?.slug)
+        if project?.slug == nil {
+            project?.slug = createResponse.slug
+        }
         let fileByPath = Dictionary(uniqueKeysWithValues: localFiles.map { ($0.path, $0) })
 
         for target in createResponse.upload.uploads {
@@ -157,17 +305,27 @@ private final class HereNowUploader {
 
         return PublishResult(
             siteURL: finalizedURL ?? createResponse.siteUrl,
+            clipboardURL: publicURL(siteURL: finalizedURL ?? createResponse.siteUrl, path: clipboardPath),
+            slug: createResponse.slug,
             claimURL: createResponse.claimUrl,
             expiresAt: createResponse.expiresAt,
             isAuthenticated: apiKey != nil,
-            fileCount: localFiles.count
+            fileCount: localFiles.count,
+            projectName: project?.name
         )
     }
 
-    private func createPublish(payload: PublishRequest, apiKey: String?) async throws -> PublishCreateResponse {
-        let url = AppConstants.apiBaseURL.appendingPathComponent("api/v1/publish")
+    private func createPublish(payload: PublishRequest, apiKey: String?, slug: String?) async throws -> PublishCreateResponse {
+        let url: URL
+        if let slug, !slug.isEmpty {
+            url = AppConstants.apiBaseURL
+                .appendingPathComponent("api/v1/publish")
+                .appendingPathComponent(slug)
+        } else {
+            url = AppConstants.apiBaseURL.appendingPathComponent("api/v1/publish")
+        }
         var request = URLRequest(url: url)
-        request.httpMethod = "POST"
+        request.httpMethod = slug == nil ? "POST" : "PUT"
         request.setValue("application/json", forHTTPHeaderField: "content-type")
         request.setValue(AppConstants.clientHeader, forHTTPHeaderField: "x-herenow-client")
         if let apiKey {
@@ -218,6 +376,122 @@ private final class HereNowUploader {
         try validateHTTP(response, data: data, context: "Finalize publish")
         let finalizeResponse = try decodeOrThrow(FinalizeResponse.self, from: data)
         return finalizeResponse.siteUrl
+    }
+
+    private func stageProjectUpload(fileURLs: [URL], project: ShareProject, cacheRoot: URL) throws -> String? {
+        try FileManager.default.createDirectory(at: cacheRoot, withIntermediateDirectories: true)
+
+        var usedPaths = try existingRelativePaths(in: cacheRoot)
+        var stagedPaths: [String] = []
+        let multipleRoots = fileURLs.count > 1
+
+        for url in fileURLs {
+            let resolvedURL = url.standardizedFileURL
+            guard FileManager.default.fileExists(atPath: resolvedURL.path) else {
+                throw UploadError.cannotReadFile(resolvedURL)
+            }
+
+            if try isDirectory(resolvedURL) {
+                let rootPrefix = multipleRoots ? ProjectStore.sanitizePathComponent(resolvedURL.lastPathComponent) + "/" : ""
+                let rootPath = resolvedURL.path
+                guard let enumerator = FileManager.default.enumerator(
+                    at: resolvedURL,
+                    includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey],
+                    options: [.skipsHiddenFiles]
+                ) else {
+                    throw UploadError.cannotReadFile(resolvedURL)
+                }
+
+                for case let fileURL as URL in enumerator {
+                    guard try !isDirectory(fileURL),
+                          FileManager.default.isReadableFile(atPath: fileURL.path) else {
+                        continue
+                    }
+                    let relativePath = String(fileURL.path.dropFirst(rootPath.count + 1))
+                    guard relativePath != ".DS_Store",
+                          !relativePath.hasPrefix(".herenow/") else {
+                        continue
+                    }
+
+                    let cleanRelativePath = rootPrefix + relativePath
+                        .split(separator: "/")
+                        .map { ProjectStore.sanitizePathComponent(String($0)) }
+                        .joined(separator: "/")
+                    let stagedPath = uniquePath(project.pathPrefix + cleanRelativePath, usedPaths: &usedPaths)
+                    try copyProjectFile(from: fileURL.standardizedFileURL, to: stagedPath, cacheRoot: cacheRoot)
+                    stagedPaths.append(stagedPath)
+                }
+            } else {
+                guard FileManager.default.isReadableFile(atPath: resolvedURL.path) else {
+                    throw UploadError.cannotReadFile(resolvedURL)
+                }
+                let fileName = ProjectStore.sanitizePathComponent(resolvedURL.lastPathComponent)
+                let stagedPath = uniquePath(project.pathPrefix + fileName, usedPaths: &usedPaths)
+                try copyProjectFile(from: resolvedURL, to: stagedPath, cacheRoot: cacheRoot)
+                stagedPaths.append(stagedPath)
+            }
+        }
+
+        if stagedPaths.count == 1 {
+            return stagedPaths[0]
+        }
+        return project.pathPrefix.isEmpty ? nil : project.pathPrefix
+    }
+
+    private func existingRelativePaths(in rootURL: URL) throws -> Set<String> {
+        guard FileManager.default.fileExists(atPath: rootURL.path) else {
+            return []
+        }
+        guard let enumerator = FileManager.default.enumerator(
+            at: rootURL,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+
+        let rootPath = rootURL.path
+        var paths = Set<String>()
+        for case let fileURL as URL in enumerator {
+            guard try !isDirectory(fileURL) else {
+                continue
+            }
+            let relativePath = String(fileURL.path.dropFirst(rootPath.count + 1))
+            paths.insert(relativePath)
+        }
+        return paths
+    }
+
+    private func copyProjectFile(from sourceURL: URL, to relativePath: String, cacheRoot: URL) throws {
+        let destinationURL = cacheRoot.appendingPathComponent(relativePath)
+        do {
+            try FileManager.default.createDirectory(
+                at: destinationURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            if FileManager.default.fileExists(atPath: destinationURL.path) {
+                try FileManager.default.removeItem(at: destinationURL)
+            }
+            try FileManager.default.copyItem(at: sourceURL, to: destinationURL)
+        } catch {
+            throw UploadError.cannotStageProject(sourceURL)
+        }
+    }
+
+    private func publicURL(siteURL: String, path: String?) -> String {
+        guard let path, !path.isEmpty, var url = URL(string: siteURL) else {
+            return siteURL
+        }
+
+        for component in path.split(separator: "/") {
+            url.appendPathComponent(String(component))
+        }
+
+        var value = url.absoluteString
+        if path.hasSuffix("/") && !value.hasSuffix("/") {
+            value += "/"
+        }
+        return value
     }
 
     private func validateHTTP(_ response: URLResponse, data: Data, context: String) throws {
@@ -616,12 +890,19 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AvatarViewDele
     private var lastPublishedURL: String?
     private var lastClaimURL: String?
     private var lastError: String?
+    private let projectStore = ProjectStore()
+    private var selectedProjectID: String?
     private var isUploading = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         lastPublishedURL = UserDefaults.standard.string(forKey: AppConstants.lastURLDefaultsKey)
         lastClaimURL = UserDefaults.standard.string(forKey: AppConstants.lastClaimURLDefaultsKey)
+        selectedProjectID = UserDefaults.standard.string(forKey: AppConstants.selectedProjectIDDefaultsKey)
+        if projectStore.project(id: selectedProjectID) == nil {
+            selectedProjectID = nil
+            UserDefaults.standard.removeObject(forKey: AppConstants.selectedProjectIDDefaultsKey)
+        }
         createPanel()
         createStatusItem()
     }
@@ -637,14 +918,20 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AvatarViewDele
 
         isUploading = true
         lastError = nil
-        avatarView.setState(.uploading, text: "Uploading")
+        let selectedProject = projectStore.project(id: selectedProjectID)
+        let projectCacheRoot = selectedProject.map { projectStore.cacheRoot(for: $0) }
+        avatarView.setState(.uploading, text: selectedProject?.name ?? "Uploading")
         rebuildMenu()
 
-        Task.detached(priority: .userInitiated) { [urls] in
+        Task.detached(priority: .userInitiated) { [urls, selectedProject, projectCacheRoot] in
             do {
-                let result = try await HereNowUploader().upload(fileURLs: urls)
+                let result = try await HereNowUploader().upload(
+                    fileURLs: urls,
+                    project: selectedProject,
+                    projectCacheRoot: projectCacheRoot
+                )
                 await MainActor.run {
-                    self.handleUploadSuccess(result)
+                    self.handleUploadSuccess(result, projectID: selectedProject?.id)
                 }
             } catch {
                 await MainActor.run {
@@ -692,6 +979,71 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AvatarViewDele
         copyToClipboard(lastClaimURL)
         avatarView?.setState(.success, text: "Claim")
         scheduleIdleReset()
+    }
+
+    @objc private func selectQuickShare(_ sender: NSMenuItem) {
+        selectedProjectID = nil
+        UserDefaults.standard.removeObject(forKey: AppConstants.selectedProjectIDDefaultsKey)
+        avatarView?.setState(.idle)
+        rebuildMenu()
+    }
+
+    @objc private func selectProject(_ sender: NSMenuItem) {
+        guard let projectID = sender.representedObject as? String,
+              projectStore.project(id: projectID) != nil else {
+            return
+        }
+        selectedProjectID = projectID
+        UserDefaults.standard.set(projectID, forKey: AppConstants.selectedProjectIDDefaultsKey)
+        avatarView?.setState(.idle)
+        rebuildMenu()
+    }
+
+    @objc private func createProject() {
+        let alert = NSAlert()
+        alert.messageText = "New Share Project"
+        alert.informativeText = "Drop files while this project is selected to append them to one stable here.now site."
+        alert.addButton(withTitle: "Create")
+        alert.addButton(withTitle: "Cancel")
+
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.spacing = 8
+        stack.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
+
+        let nameField = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        nameField.placeholderString = "Project name"
+
+        let prefixField = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        prefixField.stringValue = "uploads"
+        prefixField.placeholderString = "Folder path inside the site"
+
+        stack.addArrangedSubview(NSTextField(labelWithString: "Name"))
+        stack.addArrangedSubview(nameField)
+        stack.addArrangedSubview(NSTextField(labelWithString: "Folder path inside site"))
+        stack.addArrangedSubview(prefixField)
+        stack.setFrameSize(NSSize(width: 320, height: 92))
+        alert.accessoryView = stack
+
+        guard alert.runModal() == .alertFirstButtonReturn else {
+            return
+        }
+
+        let name = nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else {
+            NSSound.beep()
+            return
+        }
+
+        do {
+            let project = try projectStore.createProject(name: name, pathPrefix: prefixField.stringValue)
+            selectedProjectID = project.id
+            UserDefaults.standard.set(project.id, forKey: AppConstants.selectedProjectIDDefaultsKey)
+            avatarView?.setState(.idle)
+            rebuildMenu()
+        } catch {
+            handleUploadFailure(error)
+        }
     }
 
     @objc private func showAvatar() {
@@ -742,6 +1094,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AvatarViewDele
         titleItem.isEnabled = false
         menu.addItem(titleItem)
 
+        let selectedProject = projectStore.project(id: selectedProjectID)
+        let projectItem = NSMenuItem(title: "Target: \(selectedProject?.name ?? "Quick Share")", action: nil, keyEquivalent: "")
+        projectItem.submenu = projectMenu(selectedProject: selectedProject)
+        menu.addItem(projectItem)
+        menu.addItem(NSMenuItem.separator())
+
         if let lastPublishedURL {
             let displayURL = truncated(lastPublishedURL, maxLength: 52)
             let lastURLItem = NSMenuItem(title: displayURL, action: nil, keyEquivalent: "")
@@ -770,21 +1128,63 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AvatarViewDele
         statusItem?.menu = menu
     }
 
-    private func handleUploadSuccess(_ result: PublishResult) {
+    private func projectMenu(selectedProject: ShareProject?) -> NSMenu {
+        let menu = NSMenu()
+
+        let quickItem = NSMenuItem(title: "Quick Share", action: #selector(selectQuickShare), keyEquivalent: "")
+        quickItem.state = selectedProject == nil ? .on : .off
+        menu.addItem(quickItem)
+
+        if !projectStore.projects.isEmpty {
+            menu.addItem(NSMenuItem.separator())
+        }
+
+        for project in projectStore.projects {
+            let title: String
+            if let slug = project.slug, !slug.isEmpty {
+                title = "\(project.name) (\(slug))"
+            } else {
+                title = "\(project.name) (new site on next drop)"
+            }
+            let item = NSMenuItem(title: title, action: #selector(selectProject), keyEquivalent: "")
+            item.representedObject = project.id
+            item.state = selectedProject?.id == project.id ? .on : .off
+            menu.addItem(item)
+        }
+
+        menu.addItem(NSMenuItem.separator())
+        menu.addItem(NSMenuItem(title: "New Project...", action: #selector(createProject), keyEquivalent: "n"))
+        return menu
+    }
+
+    private func handleUploadSuccess(_ result: PublishResult, projectID: String?) {
         isUploading = false
-        lastPublishedURL = result.siteURL
+        lastPublishedURL = result.clipboardURL
         lastClaimURL = result.claimURL
         lastError = nil
 
-        UserDefaults.standard.set(result.siteURL, forKey: AppConstants.lastURLDefaultsKey)
+        if let projectID,
+           let slug = result.slug,
+           var project = projectStore.project(id: projectID),
+           project.slug != slug {
+            project.slug = slug
+            project.updatedAt = Date()
+            do {
+                try projectStore.updateProject(project)
+            } catch {
+                lastError = error.localizedDescription
+            }
+        }
+
+        UserDefaults.standard.set(result.clipboardURL, forKey: AppConstants.lastURLDefaultsKey)
         if let claimURL = result.claimURL {
             UserDefaults.standard.set(claimURL, forKey: AppConstants.lastClaimURLDefaultsKey)
         } else {
             UserDefaults.standard.removeObject(forKey: AppConstants.lastClaimURLDefaultsKey)
         }
 
-        copyToClipboard(result.siteURL)
-        avatarView?.setState(.success, text: "Copied")
+        copyToClipboard(result.clipboardURL)
+        avatarView?.setState(.success, text: result.projectName ?? "Copied")
         NSSound(named: "Glass")?.play()
         rebuildMenu()
         scheduleIdleReset()
